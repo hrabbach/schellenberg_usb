@@ -327,6 +327,50 @@ class SchellenbergCover(CoverEntity, RestoreEntity):
             attrs["calibrated"] = self._is_calibrated
         return attrs
 
+    def _restore_position_from_last_state(
+        self, last_state: Any
+    ) -> None:
+        """Restore cover position from a HA last-known state.
+
+        Contains the generic recorded-position restore logic: raw_position
+        extraction, int coercion, state-string fallback, clamp, is_closed,
+        and debug log.  Called from both the bidirectional and timed-idle
+        branches so the logic lives in exactly one place (REVIEW-02).
+        """
+        restored_position: int | None = None
+        raw_position = (
+            last_state.attributes.get("current_position")
+            if "current_position" in last_state.attributes
+            else last_state.attributes.get(ATTR_POSITION)
+        )
+
+        if isinstance(raw_position, (int, float)):
+            restored_position = int(raw_position)
+        elif raw_position is not None:
+            try:
+                restored_position = int(str(raw_position))
+            except ValueError:
+                restored_position = None
+
+        if restored_position is None:
+            if last_state.state == "open":
+                restored_position = 100
+            elif last_state.state == "closed":
+                restored_position = 0
+
+        if restored_position is not None:
+            self._attr_current_cover_position = max(
+                0, min(100, restored_position)
+            )
+            self._attr_is_closed = self._attr_current_cover_position == 0
+            _LOGGER.debug(
+                "Restored position for %s (%s) to %d%% (raw=%s)",
+                self._attr_name,
+                self._device_id,
+                self._attr_current_cover_position,
+                raw_position,
+            )
+
     async def async_added_to_hass(self) -> None:
         """Run when entity about to be added to hass."""
         await super().async_added_to_hass()
@@ -336,38 +380,37 @@ class SchellenbergCover(CoverEntity, RestoreEntity):
 
         # Restore the last known state
         last_state = await self.async_get_last_state()
-        if last_state:
-            restored_position: int | None = None
-            raw_position = (
-                last_state.attributes.get("current_position")
-                if "current_position" in last_state.attributes
-                else last_state.attributes.get(ATTR_POSITION)
-            )
-
-            if isinstance(raw_position, (int, float)):
-                restored_position = int(raw_position)
-            elif raw_position is not None:
-                try:
-                    restored_position = int(str(raw_position))
-                except ValueError:
-                    restored_position = None
-
-            if restored_position is None:
-                if last_state.state == "open":
-                    restored_position = 100
-                elif last_state.state == "closed":
-                    restored_position = 0
-
-            if restored_position is not None:
-                self._attr_current_cover_position = max(0, min(100, restored_position))
-                self._attr_is_closed = self._attr_current_cover_position == 0
+        if last_state and not self._is_bidirectional:
+            # D-08: timed motor mid-move restart → snap to destination endstop.
+            # This branch runs before the recorded-position restore so a stale
+            # mid-move current_position attribute is discarded (plan key-link).
+            if last_state.state == "opening":
+                self._attr_current_cover_position = 100
+                self._attr_is_closed = False
                 _LOGGER.debug(
-                    "Restored position for %s (%s) to %d%% (raw=%s)",
+                    "Timed motor %s was opening at restart,"
+                    " snapping to 100%%",
                     self._attr_name,
-                    self._device_id,
-                    self._attr_current_cover_position,
-                    raw_position,
                 )
+            elif last_state.state == "closing":
+                self._attr_current_cover_position = 0
+                self._attr_is_closed = True
+                _LOGGER.debug(
+                    "Timed motor %s was closing at restart,"
+                    " snapping to 0%%",
+                    self._attr_name,
+                )
+            else:
+                # D-09: idle timed motor → recorded position wins.
+                # The helper handles raw_position extraction, is None sentinel,
+                # and clamp.  A real recorded 0%% is preserved (not overridden).
+                # Missing-data fallback (initial_position / 100) is layered in
+                # Task 2 after this call.
+                self._restore_position_from_last_state(last_state)
+
+        elif last_state and self._is_bidirectional:
+            # Bidirectional path: use the shared helper (REVIEW-02 — no copy).
+            self._restore_position_from_last_state(last_state)
 
         if self._attr_current_cover_position is None:
             if self._initial_position is not None:
@@ -384,7 +427,8 @@ class SchellenbergCover(CoverEntity, RestoreEntity):
                 self._attr_current_cover_position = 0
                 self._attr_is_closed = True
                 _LOGGER.debug(
-                    "No previous state for %s (%s); defaulting position to 0%% (closed)",
+                    "No previous state for %s (%s);"
+                    " defaulting position to 0%% (closed)",
                     self._attr_name,
                     self._device_id,
                 )
@@ -470,6 +514,12 @@ class SchellenbergCover(CoverEntity, RestoreEntity):
     @callback
     def _handle_event(self, event: str) -> None:
         """Handle events from the USB stick for this device."""
+        # D-11 / REVIEW-04: timed motors produce no inbound frames; any stray
+        # event must not mutate state.  This guard makes D-11 structurally
+        # self-enforcing — the whole event body is skipped for timed motors.
+        if not self._is_bidirectional:
+            return
+
         _LOGGER.info(
             "Device %s (%s) received activity event: %s",
             self._attr_name,

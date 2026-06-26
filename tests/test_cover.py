@@ -1253,3 +1253,118 @@ async def test_timed_set_position_noop_when_uncalibrated(
     mock_open.assert_not_called()
     mock_close.assert_not_called()
     assert cover._attr_current_cover_position == 50
+
+
+# ---------------------------------------------------------------------------
+# 03-03: Timed motor restart restore (D-08, D-09, D-11)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_timed_restart_opening_snaps_to_100(
+    hass: HomeAssistant,
+    mock_api: SchellenbergUsbApi,
+) -> None:
+    """D-08: timed motor was opening at HA restart → restore to 100%.
+
+    The stale mid-move current_position (60%) must be discarded; the
+    endstop snap to 100% wins.  Bidirectional guard ensures this branch
+    only fires for timed motors.
+    """
+    cover = SchellenbergCover(
+        api=mock_api,
+        device_id="TM01",
+        device_enum="10",
+        device_name="Timed Motor",
+        device_data={CONF_BIDIRECTIONAL: False},
+    )
+    cover.hass = hass
+
+    last_state = State(
+        "cover.timed_motor", "opening", {"current_position": 60}
+    )
+    with patch.object(cover, "async_get_last_state", return_value=last_state):
+        with patch(
+            "custom_components.schellenberg_usb.cover"
+            ".async_dispatcher_connect"
+        ):
+            with patch.object(cover, "async_write_ha_state"):
+                await cover.async_added_to_hass()
+
+    assert cover._attr_current_cover_position == 100
+    assert cover._attr_is_closed is False
+
+
+@pytest.mark.asyncio
+async def test_timed_restart_closing_snaps_to_0(
+    hass: HomeAssistant,
+    mock_api: SchellenbergUsbApi,
+) -> None:
+    """D-08: timed motor was closing at HA restart → restore to 0%.
+
+    The stale mid-move current_position (40%) must be discarded; the
+    endstop snap to 0% wins.
+    """
+    cover = SchellenbergCover(
+        api=mock_api,
+        device_id="TM01",
+        device_enum="10",
+        device_name="Timed Motor",
+        device_data={CONF_BIDIRECTIONAL: False},
+    )
+    cover.hass = hass
+
+    last_state = State(
+        "cover.timed_motor", "closing", {"current_position": 40}
+    )
+    with patch.object(cover, "async_get_last_state", return_value=last_state):
+        with patch(
+            "custom_components.schellenberg_usb.cover"
+            ".async_dispatcher_connect"
+        ):
+            with patch.object(cover, "async_write_ha_state"):
+                await cover.async_added_to_hass()
+
+    assert cover._attr_current_cover_position == 0
+    assert cover._attr_is_closed is True
+
+
+@pytest.mark.asyncio
+async def test_timed_handle_event_ignored(
+    hass: HomeAssistant,
+    mock_api: SchellenbergUsbApi,
+) -> None:
+    """D-11 / REVIEW-04: a stray device event on a timed motor is a no-op.
+
+    _handle_event must early-return for timed motors before any state
+    mutation.  Neither is_opening nor is_closing must be set; position
+    must remain unchanged.
+    """
+    cover = SchellenbergCover(
+        api=mock_api,
+        device_id="TM01",
+        device_enum="10",
+        device_name="Timed Motor",
+        device_data={CONF_BIDIRECTIONAL: False},
+    )
+    cover.hass = hass
+    cover._attr_current_cover_position = 75
+    cover._attr_is_opening = False
+    cover._attr_is_closing = False
+
+    with patch.object(cover, "async_write_ha_state") as mock_write:
+        cover._handle_event(EVENT_STARTED_MOVING_UP)
+
+    # No state mutation, no HA state write
+    assert cover._attr_is_opening is False
+    assert cover._attr_is_closing is False
+    assert cover._attr_current_cover_position == 75
+    mock_write.assert_not_called()
+
+    with patch.object(cover, "async_write_ha_state") as mock_write2:
+        cover._handle_event(EVENT_STOPPED)
+
+    assert cover._attr_is_opening is False
+    assert cover._attr_is_closing is False
+    assert cover._attr_current_cover_position == 75
+    mock_write2.assert_not_called()
