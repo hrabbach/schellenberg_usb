@@ -66,9 +66,14 @@ async def _get_cal_store(hass: HomeAssistant) -> tuple[Store, dict[str, Any]]:
     if cache is None:
         try:
             cache = await store.async_load() or {}
-        except Exception:
-            # If the JSON is corrupted, don't break the integration setup
-            _LOGGER.exception("Failed to load calibration store, starting with empty data")
+        except Exception:  # noqa: BLE001
+            # If the JSON is corrupted, don't break the integration setup.
+            # Broad catch is intentional: Store.async_load can surface a
+            # range of deserialization/OS errors on a corrupt record, and
+            # setup must degrade to an empty cache rather than fail.
+            _LOGGER.exception(
+                "Failed to load calibration store, starting with empty data"
+            )
             cache = {}
         data[_DATA_CACHE] = cache
 
@@ -215,7 +220,7 @@ class SchellenbergCover(CoverEntity, RestoreEntity):
 
     _attr_has_entity_name = True
     _attr_should_poll = False
-    _unrecorded_attributes = frozenset({"mode"})
+    _unrecorded_attributes = frozenset({"mode", "calibrated"})
 
     _attr_supported_features = (
         CoverEntityFeature.OPEN
@@ -256,11 +261,16 @@ class SchellenbergCover(CoverEntity, RestoreEntity):
 
         # Position calculation attributes - use calibration times if available
         device_data_dict = dict(device_data) if device_data is not None else {}
-        self._travel_time_open: float = device_data_dict.get(
-            CONF_OPEN_TIME, DEFAULT_TRAVEL_TIME
+        # Coerce None/0.0 from persisted/merged data to the default: a
+        # partial/corrupt calibration record can store None for a time
+        # (and .get(key, default) returns the stored None when the key is
+        # present), and a 0-second travel time would divide-by-zero
+        # downstream — both must fall back to DEFAULT_TRAVEL_TIME (WR-03).
+        self._travel_time_open: float = (
+            device_data_dict.get(CONF_OPEN_TIME) or DEFAULT_TRAVEL_TIME
         )
-        self._travel_time_close: float = device_data_dict.get(
-            CONF_CLOSE_TIME, DEFAULT_TRAVEL_TIME
+        self._travel_time_close: float = (
+            device_data_dict.get(CONF_CLOSE_TIME) or DEFAULT_TRAVEL_TIME
         )
 
         # Mode flag: True = bidirectional (can receive events), False = timed.
@@ -280,6 +290,15 @@ class SchellenbergCover(CoverEntity, RestoreEntity):
             int(device_data_dict[CONF_INITIAL_POSITION])
             if CONF_INITIAL_POSITION in device_data_dict
             else None
+        )
+
+        # Calibrated = real open AND close times explicitly present (non-None).
+        # The DEFAULT_TRAVEL_TIME fallback does NOT count as calibrated (D-06).
+        # Value-presence check (is not None), not key-presence: a key present
+        # but explicitly set to None must not be treated as calibrated (REVIEW-01).
+        self._is_calibrated: bool = (
+            device_data_dict.get(CONF_OPEN_TIME) is not None
+            and device_data_dict.get(CONF_CLOSE_TIME) is not None
         )
 
         self._move_start_time: float | None = None
@@ -311,9 +330,56 @@ class SchellenbergCover(CoverEntity, RestoreEntity):
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         """Return device-specific state attributes."""
-        return {
+        attrs: dict[str, Any] = {
             "mode": "bidirectional" if self._is_bidirectional else "timed",
         }
+        if not self._is_bidirectional:
+            attrs["calibrated"] = self._is_calibrated
+        return attrs
+
+    def _restore_position_from_last_state(
+        self, last_state: Any
+    ) -> None:
+        """Restore cover position from a HA last-known state.
+
+        Contains the generic recorded-position restore logic: raw_position
+        extraction, int coercion, state-string fallback, clamp, is_closed,
+        and debug log.  Called from both the bidirectional and timed-idle
+        branches so the logic lives in exactly one place (REVIEW-02).
+        """
+        restored_position: int | None = None
+        raw_position = (
+            last_state.attributes.get("current_position")
+            if "current_position" in last_state.attributes
+            else last_state.attributes.get(ATTR_POSITION)
+        )
+
+        if isinstance(raw_position, (int, float)):
+            restored_position = int(raw_position)
+        elif raw_position is not None:
+            try:
+                restored_position = int(str(raw_position))
+            except ValueError:
+                restored_position = None
+
+        if restored_position is None:
+            if last_state.state == "open":
+                restored_position = 100
+            elif last_state.state == "closed":
+                restored_position = 0
+
+        if restored_position is not None:
+            self._attr_current_cover_position = max(
+                0, min(100, restored_position)
+            )
+            self._attr_is_closed = self._attr_current_cover_position == 0
+            _LOGGER.debug(
+                "Restored position for %s (%s) to %d%% (raw=%s)",
+                self._attr_name,
+                self._device_id,
+                self._attr_current_cover_position,
+                raw_position,
+            )
 
     async def async_added_to_hass(self) -> None:
         """Run when entity about to be added to hass."""
@@ -324,38 +390,37 @@ class SchellenbergCover(CoverEntity, RestoreEntity):
 
         # Restore the last known state
         last_state = await self.async_get_last_state()
-        if last_state:
-            restored_position: int | None = None
-            raw_position = (
-                last_state.attributes.get("current_position")
-                if "current_position" in last_state.attributes
-                else last_state.attributes.get(ATTR_POSITION)
-            )
-
-            if isinstance(raw_position, (int, float)):
-                restored_position = int(raw_position)
-            elif raw_position is not None:
-                try:
-                    restored_position = int(str(raw_position))
-                except ValueError:
-                    restored_position = None
-
-            if restored_position is None:
-                if last_state.state == "open":
-                    restored_position = 100
-                elif last_state.state == "closed":
-                    restored_position = 0
-
-            if restored_position is not None:
-                self._attr_current_cover_position = max(0, min(100, restored_position))
-                self._attr_is_closed = self._attr_current_cover_position == 0
+        if last_state and not self._is_bidirectional:
+            # D-08: timed motor mid-move restart → snap to destination endstop.
+            # This branch runs before the recorded-position restore so a stale
+            # mid-move current_position attribute is discarded (plan key-link).
+            if last_state.state == "opening":
+                self._attr_current_cover_position = 100
+                self._attr_is_closed = False
                 _LOGGER.debug(
-                    "Restored position for %s (%s) to %d%% (raw=%s)",
+                    "Timed motor %s was opening at restart,"
+                    " snapping to 100%%",
                     self._attr_name,
-                    self._device_id,
-                    self._attr_current_cover_position,
-                    raw_position,
                 )
+            elif last_state.state == "closing":
+                self._attr_current_cover_position = 0
+                self._attr_is_closed = True
+                _LOGGER.debug(
+                    "Timed motor %s was closing at restart,"
+                    " snapping to 0%%",
+                    self._attr_name,
+                )
+            else:
+                # D-09: idle timed motor → recorded position wins.
+                # The helper handles raw_position extraction, is None sentinel,
+                # and clamp.  A real recorded 0%% is preserved (not overridden).
+                # Missing-data fallback (initial_position / 100) is layered in
+                # Task 2 after this call.
+                self._restore_position_from_last_state(last_state)
+
+        elif last_state and self._is_bidirectional:
+            # Bidirectional path: use the shared helper (REVIEW-02 — no copy).
+            self._restore_position_from_last_state(last_state)
 
         if self._attr_current_cover_position is None:
             if self._initial_position is not None:
@@ -368,11 +433,24 @@ class SchellenbergCover(CoverEntity, RestoreEntity):
                     self._attr_name,
                     self._attr_current_cover_position,
                 )
-            else:
+            elif self._is_bidirectional:
+                # Bidirectional: default to 0 (closed) — existing behavior.
                 self._attr_current_cover_position = 0
                 self._attr_is_closed = True
                 _LOGGER.debug(
-                    "No previous state for %s (%s); defaulting position to 0%% (closed)",
+                    "No previous state for %s (%s);"
+                    " defaulting position to 0%% (closed)",
+                    self._attr_name,
+                    self._device_id,
+                )
+            else:
+                # D-09: timed motor with no prior state → assume open (100%%).
+                # Never collapse missing data to 0 (SC#4 slider regression).
+                self._attr_current_cover_position = 100
+                self._attr_is_closed = False
+                _LOGGER.debug(
+                    "No previous state for timed motor %s (%s);"
+                    " defaulting to 100%% (assume open)",
                     self._attr_name,
                     self._device_id,
                 )
@@ -436,6 +514,10 @@ class SchellenbergCover(CoverEntity, RestoreEntity):
         self._attr_current_cover_position = 0
         self._attr_is_closed = True
 
+        # Flip calibrated flag so the attribute reflects live state (REVIEW-05).
+        # Must run BEFORE async_write_ha_state() so the pushed state is correct.
+        self._is_calibrated = True
+
         _LOGGER.info(
             "Device %s calibration updated: open_time=%.2fs, close_time=%.2fs. "
             "Cover position set to fully closed (0%%)",
@@ -454,6 +536,12 @@ class SchellenbergCover(CoverEntity, RestoreEntity):
     @callback
     def _handle_event(self, event: str) -> None:
         """Handle events from the USB stick for this device."""
+        # D-11 / REVIEW-04: timed motors produce no inbound frames; any stray
+        # event must not mutate state.  This guard makes D-11 structurally
+        # self-enforcing — the whole event body is skipped for timed motors.
+        if not self._is_bidirectional:
+            return
+
         _LOGGER.info(
             "Device %s (%s) received activity event: %s",
             self._attr_name,
@@ -544,7 +632,6 @@ class SchellenbergCover(CoverEntity, RestoreEntity):
                         self._attr_is_closing = False
                         self._attr_is_closed = self._attr_current_cover_position == 0
                         self._target_position = None
-                        self._position_update_task = None
                         self._move_start_time = None
                         self._move_start_position = None
                         self.async_write_ha_state()
@@ -557,7 +644,6 @@ class SchellenbergCover(CoverEntity, RestoreEntity):
                         and self._attr_current_cover_position <= 0
                     ):
                         self._attr_current_cover_position = 0
-                        self._position_update_task = None
                         self._attr_is_opening = False
                         self._attr_is_closing = False
                         self._move_start_time = None
@@ -571,7 +657,6 @@ class SchellenbergCover(CoverEntity, RestoreEntity):
                         and self._attr_current_cover_position >= 100
                     ):
                         self._attr_current_cover_position = 100
-                        self._position_update_task = None
                         self._attr_is_opening = False
                         self._attr_is_closing = False
                         self._move_start_time = None
@@ -585,8 +670,13 @@ class SchellenbergCover(CoverEntity, RestoreEntity):
 
         except asyncio.CancelledError:
             _LOGGER.debug("Position tracking cancelled for device %s", self._attr_name)
-            self._position_update_task = None
             raise
+        finally:
+            # Clear the handle only if it still points at THIS task, so a
+            # concurrent _start_position_tracking() that already swapped in a
+            # new task isn't clobbered by this one's exit (WR-02).
+            if self._position_update_task is asyncio.current_task():
+                self._position_update_task = None
 
     def _update_position(self) -> None:
         """Calculate and update the position based on travel time."""
@@ -611,7 +701,9 @@ class SchellenbergCover(CoverEntity, RestoreEntity):
         else:
             return
 
-        self._attr_current_cover_position = max(0, min(100, int(new_pos)))
+        self._attr_current_cover_position = max(
+            0, min(100, int(round(new_pos)))
+        )
         self._attr_is_closed = self._attr_current_cover_position == 0
 
         _LOGGER.debug(
@@ -622,9 +714,18 @@ class SchellenbergCover(CoverEntity, RestoreEntity):
             travel_time,
         )
 
-    async def async_open_cover(self, **kwargs: Any) -> None:
-        """Open the cover."""
+    async def async_open_cover(
+        self, target: int | None = None, **kwargs: Any
+    ) -> None:
+        """Open the cover.
+
+        ``target`` is the partial-move target for a set-position driven
+        move; a direct Open (the HA open button) passes ``None``, which
+        clears any stale set-position target so the cover runs to the
+        endstop instead of stopping at a leftover partial target (CR-01).
+        """
         _LOGGER.debug("Opening cover %s (enum=%s)", self._attr_name, self._device_enum)
+        self._target_position = target
         self._attr_is_opening = True
         self._attr_is_closing = False
         self._move_start_time = time.monotonic()
@@ -637,9 +738,18 @@ class SchellenbergCover(CoverEntity, RestoreEntity):
         self.async_write_ha_state()
         await self._api.control_blind(self._device_enum, CMD_UP)
 
-    async def async_close_cover(self, **kwargs: Any) -> None:
-        """Close cover."""
+    async def async_close_cover(
+        self, target: int | None = None, **kwargs: Any
+    ) -> None:
+        """Close cover.
+
+        ``target`` is the partial-move target for a set-position driven
+        move; a direct Close (the HA close button) passes ``None``, which
+        clears any stale set-position target so the cover runs to the
+        endstop instead of stopping at a leftover partial target (CR-01).
+        """
         _LOGGER.debug("Closing cover %s (enum=%s)", self._attr_name, self._device_enum)
+        self._target_position = target
         self._attr_is_opening = False
         self._attr_is_closing = True
         self._move_start_time = time.monotonic()
@@ -667,6 +777,12 @@ class SchellenbergCover(CoverEntity, RestoreEntity):
 
     async def async_set_cover_position(self, **kwargs: Any) -> None:
         """Move the cover to a specific position."""
+        if not self._is_bidirectional and not self._is_calibrated:
+            _LOGGER.debug(
+                "Timed motor %s: set-position ignored (not calibrated yet)",
+                self._attr_name,
+            )
+            return
         target_position = kwargs[ATTR_POSITION]
 
         if self._attr_current_cover_position is None:
@@ -693,13 +809,13 @@ class SchellenbergCover(CoverEntity, RestoreEntity):
                 self._attr_name,
                 target_position,
             )
-            await self.async_open_cover()
+            await self.async_open_cover(target=target_position)
         else:
             _LOGGER.info(
                 "Moving cover %s DOWN to reach target %d%%",
                 self._attr_name,
                 target_position,
             )
-            await self.async_close_cover()
+            await self.async_close_cover(target=target_position)
         # The position tracking loop will automatically send the stop command
         # when the target position is reached.
